@@ -9,23 +9,17 @@ import os
 from pathlib import Path
 import re
 import sys
-from zoneinfo import ZoneInfo
 
 from brief import clean, clip, candidate
 from collect import ROOTS, collect, save
 from coverage_report import render as render_coverage
 
-DEFAULT_STORE = Path.home() / ".local/share/daily-recap"
+from storage import default_store, metadata, atomic_text, atomic_json
+
+DEFAULT_STORE = default_store()
 
 
-def local_zone(name=None):
-    if name:
-        return ZoneInfo(name)
-    try:
-        with Path("/etc/localtime").open("rb") as handle:
-            return ZoneInfo.from_file(handle, key="local")
-    except OSError:
-        return datetime.now().astimezone().tzinfo
+from time_utils import local_zone
 
 
 def days_between(start, end):
@@ -38,7 +32,9 @@ def frozen(target):
     meta = target.with_suffix(".meta.json")
     if not target.is_file() or not meta.is_file():
         return False
-    data = json.loads(meta.read_text())
+    if target.with_suffix('.publishing.json').exists():
+        return False
+    data = metadata(meta)
     return data.get("mode") == "history" and data.get("frozen") is True
 
 
@@ -113,7 +109,7 @@ def daily_report(day, sessions, evidence, coverage_path, generated_at, tz):
     else:
         lines.append("无可提取的明确断点。" if not sessions else "末次答复没有提取到明确断点；不代表工作全部完成。各会话停点见下方索引。")
     lines.extend(["", "## 会话索引", ""])
-    index = json.loads((evidence / "index.json").read_text())
+    index = json.loads((evidence / "index.json").read_text(encoding='utf-8'))
     for i, (s, summary) in enumerate(zip(sessions, index["sessions"]), 1):
         goal, last = describe(s)
         lines.extend([f"### S{i:03d} · {s['agent']} · {s['cwd'] or '项目未记录'}", "",
@@ -147,24 +143,19 @@ def write_day(store, day, sessions, run, coverage, generated_at, tz, expected_ha
             "sources": [str(evidence / "index.json")], "coverage": str(coverage),
             "sessions": len(sessions), "messages": sum(len(s["messages"]) for s in sessions),
             "projects": len({s['cwd'] for s in sessions}), "report": str(target)}
-    lock = target.with_suffix(".lock")
-    fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-    try:
-        os.close(fd)
+    from reports import report_lock
+    with report_lock(target):
         if content_hash(target) != expected_hash:
             raise RuntimeError(f"Concurrent report change: {target}")
         if target.exists():
             (evidence / "previous-report.md").write_bytes(target.read_bytes())
             if target.with_suffix(".meta.json").exists():
                 (evidence / "previous-report.meta.json").write_bytes(target.with_suffix(".meta.json").read_bytes())
-        staged = evidence / "report.tmp"
-        staged.write_text(text)
-        os.replace(staged, target)
-        staged_meta = evidence / "meta.tmp"
-        staged_meta.write_text(json.dumps(meta, ensure_ascii=False, indent=2)+"\n")
-        os.replace(staged_meta, target.with_suffix(".meta.json"))
-    finally:
-        lock.unlink()
+        marker = target.with_suffix('.publishing.json')
+        atomic_json(marker, {'pid': os.getpid(), 'evidence': str(evidence)})
+        atomic_text(target, text)
+        atomic_json(target.with_suffix('.meta.json'), meta)
+        marker.unlink()
     return meta
 
 
@@ -172,7 +163,7 @@ def write_year_index(store, year, days):
     rows, statuses = [], Counter()
     for day in days:
         p = store / "daily" / f"{day}.md"
-        m = json.loads(p.with_suffix(".meta.json").read_text())
+        m = metadata(p.with_suffix('.meta.json'))
         status = "空白占位" if m.get("placeholder") else "有记录"
         statuses[status] += 1
         rows.append(f"| [{day}](daily/{day}.md) | {status} | {m.get('projects', '—')} | {m.get('sessions', '—')} | {m.get('messages', '—')} |")
@@ -180,7 +171,7 @@ def write_year_index(store, year, days):
             "", "历史快照只反映当天消息；空白仅表示目前未找到可读取记录。今日和未来日期不生成占位。", "",
             "| 日期 | 状态 | 项目数 | 会话单元 | 消息数 |", "|---|---|---:|---:|---:|", *rows, ""]
     target = store / f"history-{year}.md"
-    target.write_text("\n".join(text))
+    atomic_text(target, "\n".join(text))
     return target, dict(statuses)
 
 
@@ -195,8 +186,10 @@ def backfill(args):
     days = list(days_between(start,end))
     store = args.store.expanduser().resolve()
     wanted = [d for d in days if args.rebuild or not frozen(store / "daily" / f"{d}.md")]
+    checked_at = datetime.now(tz).isoformat()
     if not wanted:
-        return {"status": "cached", "days": len(days), "scanned": False, "reason": "全部为已完成历史快照；未检查源会话变化", "store": str(store)}
+        return {"status": "cached", "days": len(days), "scanned": False, 'checked_at': checked_at,
+                'source_checked': False, "reason": "全部为已完成历史快照；未检查源会话变化", "store": str(store)}
     overrides = {}
     for item in args.root:
         key, sep, value = item.partition("=")
@@ -210,27 +203,43 @@ def backfill(args):
     lower = datetime.combine(min(wanted),time.min,tzinfo=tz)
     upper = datetime.combine(max(wanted)+timedelta(days=1),time.min,tzinfo=tz)
     print(f"一次扫描：{lower.isoformat()} → {upper.isoformat()}；待生成 {len(wanted)} 天",file=sys.stderr,flush=True)
-    result = collect(args.home.expanduser().resolve(),overrides,lower,upper,upper,max_chars=3000)
-    partitions = partition(result.pop("sessions"),set(wanted))
-    result["collected_at"] = generated_at
-    result["mode"] = "history_batch"
-    coverage = run / "coverage.md"
-    coverage.write_text(render_coverage(result).replace(f"# {result['date']} 采集覆盖情况", f"# {args.year} 历史补报来源覆盖", 1))
-    (run / "coverage.json").write_text(json.dumps(result,ensure_ascii=False,indent=2)+"\n")
     counts = Counter()
-    for i, day in enumerate(wanted,1):
-        meta = write_day(store,day,partitions.get(day,[]),run,coverage,generated_at,tz,expected[day])
-        counts["placeholders" if meta["placeholder"] else "active_days"] += 1
-        if i % 50 == 0 or i == len(wanted):
-            print(f"已保存 {i}/{len(wanted)} 天",file=sys.stderr,flush=True)
-    year_days = sorted(date.fromisoformat(p.stem) for p in (store / "daily").glob(f"{args.year}-??-??.md")
-                       if frozen(p))
-    index, totals = write_year_index(store,args.year,year_days)
-    summary = {"status":"completed","start":str(start),"end":str(end),"generated":len(wanted),
-               "reused":len(days)-len(wanted),**counts,"index":str(index),"coverage":str(coverage),
-               "totals":totals,"scanned":True,"model_calls":0}
-    (run / "summary.json").write_text(json.dumps(summary,ensure_ascii=False,indent=2)+"\n")
-    return summary
+    completed = []
+    state = {'status': 'running', 'pid': os.getpid(), 'wanted': [str(d) for d in wanted],
+             'completed': completed, 'checked_at': checked_at}
+    atomic_json(run / 'status.json', state)
+    try:
+        result = collect(args.home.expanduser().resolve(),overrides,lower,upper,upper,max_chars=3000,
+                         cache_dir=store / 'cache/records')
+        partitions = partition(result.pop("sessions"),set(wanted))
+        result["collected_at"] = generated_at
+        result["mode"] = "history_batch"
+        coverage = run / "coverage.md"
+        atomic_text(coverage, render_coverage(result).replace(f"# {result['date']} 采集覆盖情况", f"# {args.year} 历史补报来源覆盖", 1))
+        atomic_json(run / 'coverage.json', result)
+        for i, day in enumerate(wanted,1):
+            meta = write_day(store,day,partitions.get(day,[]),run,coverage,generated_at,tz,expected[day])
+            counts["placeholders" if meta["placeholder"] else "active_days"] += 1
+            completed.append(str(day))
+            atomic_json(run / 'status.json', state)
+            if i % 50 == 0 or i == len(wanted):
+                print(f"已保存 {i}/{len(wanted)} 天",file=sys.stderr,flush=True)
+        year_days = sorted(date.fromisoformat(p.stem) for p in (store / "daily").glob(f"{args.year}-??-??.md")
+                           if frozen(p))
+        index, totals = write_year_index(store,args.year,year_days)
+        summary = {"status":"completed","start":str(start),"end":str(end),"generated":len(wanted),
+                   "reused":len(days)-len(wanted),**counts,"index":str(index),"coverage":str(coverage),
+                   "totals":totals,"scanned":True,"model_calls":0, 'checked_at': checked_at,
+                   'source_checked': True}
+        atomic_json(run / 'summary.json', summary)
+        atomic_json(run / 'status.json', dict(state, status='completed'))
+        return summary
+    except BaseException as exc:
+        failure = dict(state, status='failed', error=type(exc).__name__,
+                       remaining=[str(d) for d in wanted if str(d) not in completed])
+        atomic_json(run / 'failed.json', failure)
+        atomic_json(run / 'status.json', failure)
+        raise
 
 
 def main():

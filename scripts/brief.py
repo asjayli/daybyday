@@ -74,7 +74,7 @@ def briefing(index, budget):
             "用 brief.py INDEX --session 编号 按需读取证据；默认不要读取 index.json 或全部 sessions。\n"]
     bodies = []
     for i, s in enumerate(sessions, 1):
-        obj = json.loads(Path(s["evidence"]).read_text())
+        obj = json.loads(Path(s["evidence"]).read_text(encoding='utf-8'))
         bodies.append((f"## S{i:03d} {s['agent']} | {s['cwd'] or '项目未知'} | {s['target_messages']}条 / 后续{s['followup_messages']}条", obj))
     # Decrease per-field allowance until the entire briefing fits the global budget.
     for size in [500, 350, 250, 180, 120, 80, 40]:
@@ -103,39 +103,52 @@ def main():
     parser.add_argument("--offset", type=int, default=0)
     parser.add_argument("--limit", type=int)
     args = parser.parse_args()
-    if args.budget < 2000 or args.tail < 1 or args.offset < 0:
-        parser.error("budget>=2000, tail>=1, offset>=0")
-    index = json.loads(args.index.read_text())
+    if args.budget < 2000 or args.tail < 1 or args.offset < 0 or (args.limit is not None and args.limit < 1):
+        parser.error("budget>=2000, tail>=1, offset>=0, limit>=1")
+    index = json.loads(args.index.read_text(encoding='utf-8'))
     if args.session:
         num = int(args.session.lstrip("Ss"))
         if not 1 <= num <= len(index["sessions"]):
             parser.error("会话编号越界")
         s = index["sessions"][num-1]
-        obj = json.loads(Path(s["evidence"]).read_text())
+        obj = json.loads(Path(s["evidence"]).read_text(encoding='utf-8'))
         messages = obj["messages"]
         if args.query:
             messages = [m for m in messages if args.query.lower() in m["text"].lower()]
         chunks = [f"{m['at']} {m['role']} {m['period']} {m['source']}\n{m['text']}" for m in messages[-args.tail:]]
         output = "\n\n".join(chunks)
-        print(clip(output, args.budget))
-        if len(output) > args.budget:
-            print("[输出已截断；减小 --tail 或使用 --query 定位]")
+        suffix = '\n[输出已截断；减小 --tail 或使用 --query 定位]\n'
+        if len(output) + 1 > args.budget:
+            print(clip(output, args.budget - len(suffix)) + suffix, end='')
+        else:
+            print(output)
         return
     if args.limit is not None:
+        output = ''
+        next_offset = args.offset
         for i, s in enumerate(index["sessions"][args.offset:args.offset+args.limit], args.offset+1):
-            obj = json.loads(Path(s["evidence"]).read_text())
-            print(f"S{i:03d} {s['agent']} {s['cwd']}\n{card(obj, 180)}\n")
+            obj = json.loads(Path(s["evidence"]).read_text(encoding='utf-8'))
+            part = f"S{i:03d} {s['agent']} {s['cwd']}\n{card(obj, 180)}\n\n"
+            if len(output) + len(part) + 160 > args.budget:
+                break
+            output += part
+            next_offset = i
+        if next_offset < len(index['sessions']):
+            if next_offset == args.offset:
+                output += '单条摘要超过预算，请用 --session 定点读取后再推进 offset。\n'
+            output += f'尚有会话未展示；下一页 --offset {next_offset} --limit {args.limit}\n'
+        print(output, end='')
         return
     output = briefing(index, args.budget)
     path = args.index.parent / "brief.md"
-    path.write_text(output)
+    path.write_text(output, encoding='utf-8')
     coverage = {k: v for k, v in index.items() if k != "sessions"}
-    (args.index.parent / "coverage.json").write_text(json.dumps(coverage, ensure_ascii=False, indent=2) + "\n")
-    (args.index.parent / "coverage.md").write_text(render(coverage))
+    (args.index.parent / "coverage.json").write_text(json.dumps(coverage, ensure_ascii=False, indent=2) + "\n", encoding='utf-8')
+    (args.index.parent / "coverage.md").write_text(render(coverage), encoding='utf-8')
     sources = ["# 会话来源索引\n"]
     for i, s in enumerate(index["sessions"], 1):
         sources.append(f"- S{i:03d} · {s['agent']} · `{s['session_id']}` · {s['cwd']} · [证据]({s['evidence']}) · 原始来源 `{s['source']}`")
-    (args.index.parent / "sources.md").write_text("\n".join(sources) + "\n")
+    (args.index.parent / "sources.md").write_text("\n".join(sources) + "\n", encoding='utf-8')
     print(json.dumps({"brief": str(path), "characters": len(output), "sessions": len(index["sessions"])}, ensure_ascii=False))
 
 

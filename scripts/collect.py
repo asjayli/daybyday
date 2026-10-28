@@ -13,25 +13,14 @@ import os
 from pathlib import Path
 import re
 import sqlite3
-from zoneinfo import ZoneInfo
 from adapters import extra_records
 from local_stores import cursor_records, cursor_session_ids, inventory
 
 
-ROOTS = {
-    "pi": ".pi/agent/sessions",
-    "claude": ".claude/projects",
-    "codex": ".codex/sessions",
-    "gemini": ".gemini/tmp",
-    "cursor": ".cursor/projects",
-    "cursor-db": ".config/Cursor/User/globalStorage/state.vscdb",
-    "opencode": ".local/share/opencode/opencode.db",
-    "zcode": ".zcode/cli/db/db.sqlite",
-    "zcode-desktop": ".zcode/v2/sessions",
-    "kimi": ".kimi/sessions",
-    "kimi-code": ".kimi-code/sessions",
-    "deepseek-harness": ".dsh/sessions",
-}
+from sources import ROOTS, source_paths, parser_version
+from record_cache import RecordCache
+from storage import default_store
+from time_utils import local_zone
 
 
 def stamp(value):
@@ -60,7 +49,8 @@ def text_of(content):
 
 def redact(text):
     # If a credential is named once, redact repeated mentions in the same message too.
-    secrets = re.findall(r"(?i)\b(?:root|admin|postgres)\s*/\s*([^\s`，。；]+)", text)
+    account_secret = r"(?i)\b(?:root|admin|postgres)\s*/\s+(?![^\s`，。；]*[/\\])([^\s`，。；]+)"
+    secrets = re.findall(account_secret, text)
     for value in secrets:
         if len(value) >= 4:
             text = text.replace(value, "[REDACTED]")
@@ -69,7 +59,7 @@ def redact(text):
     text = re.sub(r"\b(?:sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,})\b", "[REDACTED]", text)
     text = re.sub(r"(?i)(\b(?:api[_-]?key|access[_-]?token|password|secret)\b[\"']?\s*[:=]\s*)[\"']?[^\s\"',;]+",
                   r"\1[REDACTED]", text)
-    text = re.sub(r"(?i)(\b(?:root|admin|postgres)\s*/\s*)[^\s`，。；]+", r"\1[REDACTED]", text)
+    text = re.sub(account_secret, lambda m: m.group(0).replace(m.group(1), '[REDACTED]'), text)
     text = re.sub(r"((?:密码|口令)(?:已[^\n。]{0,30})?(?:为|是|[:：])\s*)`?[^\s`，。；]+", r"\1[REDACTED]", text)
     text = re.sub(r"(://[^\s:/]+:)[^\s@/]+@", r"\1[REDACTED]@", text)
     return re.sub(r"(?i)(bearer\s+)[A-Za-z0-9._~+/-]+=*", r"\1[REDACTED]", text)
@@ -80,14 +70,14 @@ def records(path, source, warnings):
     cwd, sid = None, path.stem
     if source == "gemini":
         try:
-            obj = json.loads(path.read_text())
+            obj = json.loads(path.read_text(encoding='utf-8'))
             for n, m in enumerate(obj.get("messages", [])):
                 role = {"model": "assistant", "gemini": "assistant"}.get(m.get("type"), m.get("type"))
                 yield obj.get("sessionId", sid), obj.get("cwd"), role, stamp(m.get("timestamp")), text_of(m.get("content")), f"{path}#messages[{n}]"
         except (ValueError, OSError, AttributeError, TypeError) as e:
             warnings.append(f"{path}: {type(e).__name__}")
         return
-    with path.open(errors="replace") as handle:
+    with path.open(encoding='utf-8') as handle:
         for n, line in enumerate(handle, 1):
             try:
                 obj = json.loads(line)
@@ -127,8 +117,9 @@ def db_records(path, start, now):
                 yield sid, cwd, m.get("role"), stamp(ts), p.get("text", ""), f"{path}#message={mid}&part={pid}"
 
 
-def collect(home, overrides, start, end, now, max_chars=6000):
+def collect(home, overrides, start, end, now, max_chars=6000, cache_dir=None):
     sessions, coverage, warnings, uncertain = {}, {}, [], []
+    cache = RecordCache(cache_dir, parser_version()) if cache_dir else None
     cursor_db = overrides.get("cursor-db", home / ROOTS["cursor-db"])
     try:
         mirrored_ids = cursor_session_ids(cursor_db)
@@ -146,15 +137,7 @@ def collect(home, overrides, start, end, now, max_chars=6000):
         before = len(warnings)
         if not root.exists():
             continue
-        if source in ("opencode", "zcode", "cursor-db"):
-            paths = [root]
-        else:
-            pattern = {"gemini": "session-*.json", "zcode-desktop": "session_*.json",
-                       "kimi": "wire.jsonl", "kimi-code": "wire.jsonl",
-                       "deepseek-harness": "session*.jsonl*"}.get(source, "*.jsonl")
-            paths = sorted(root.rglob(pattern))
-            if source == "cursor":
-                paths = [p for p in paths if "agent-transcripts" in p.parts]
+        paths = source_paths(source, root)
         for path in paths:
             if source == "cursor" and path.stem in mirrored_ids:
                 stats["mirrors_superseded"] += 1
@@ -164,13 +147,14 @@ def collect(home, overrides, start, end, now, max_chars=6000):
             undated = 0
             try:
                 if source == "cursor-db":
-                    stream = cursor_records(path, warnings, stamp)
+                    loader = lambda: cursor_records(path, warnings, stamp)
                 elif source in ("opencode", "zcode"):
-                    stream = db_records(path, start, now)
+                    loader = lambda: db_records(path, start, now)
                 elif source in ("kimi", "kimi-code", "zcode-desktop", "deepseek-harness"):
-                    stream = extra_records(path, source, warnings, stamp, text_of)
+                    loader = lambda: extra_records(path, source, warnings, stamp, text_of)
                 else:
-                    stream = records(path, source, warnings)
+                    loader = lambda: records(path, source, warnings)
+                stream = cache.records(source, path, loader, warnings, stamp, redact) if cache else loader()
                 for sid, cwd, role, ts, text, ref in stream:
                     if role not in ("user", "assistant") or not text.strip():
                         continue
@@ -204,7 +188,7 @@ def collect(home, overrides, start, end, now, max_chars=6000):
                     uncertain.append({"agent": source, "source": str(path), "messages": undated,
                                       "mtime": datetime.fromtimestamp(path.stat().st_mtime, start.tzinfo).isoformat(),
                                       "reason": "缺少带时区的消息时间；mtime 不能证明工作发生日期"})
-            except (OSError, sqlite3.Error, ValueError, TypeError) as e:
+            except (OSError, sqlite3.Error, ValueError, TypeError, AttributeError, KeyError, IndexError) as e:
                 warnings.append(f"{path}: {type(e).__name__}: {e}")
         stats["errors"] = len(warnings) - before
         if stats["errors"] or stats["undated_messages"]:
@@ -245,6 +229,7 @@ def collect(home, overrides, start, end, now, max_chars=6000):
     selected.extend(sorted(continuations, key=lambda s: (s["cwd"], s["messages"][0]["at"])))
     return {"date": start.date().isoformat(), "window": [start.isoformat(), end.isoformat()],
             "collected_at": now.isoformat(), "coverage": coverage, "warnings": warnings,
+            "cache": {"hits": cache.hits, "misses": cache.misses} if cache else None,
             "undated_sources": uncertain, "additional_candidates": inventory(home), "sessions": selected}
 
 
@@ -256,7 +241,7 @@ def save(result, out):
     for i, session in enumerate(result.pop("sessions"), 1):
         name = f"{i:03d}-{session['agent']}-{hashlib.sha256(session['source'].encode()).hexdigest()[:10]}.json"
         p = evidence / name
-        p.write_text(json.dumps(session, ensure_ascii=False, indent=2) + "\n")
+        p.write_text(json.dumps(session, ensure_ascii=False, indent=2) + "\n", encoding='utf-8')
         messages = session["messages"]
         target = [m for m in messages if m["period"] == "target"]
         excerpt = target or messages
@@ -266,7 +251,7 @@ def save(result, out):
             "first": excerpt[0]["at"], "last": excerpt[-1]["at"],
             "opening": excerpt[0]["text"][:350], "ending": excerpt[-1]["text"][-650:]})
     result["sessions"] = index
-    (out / "index.json").write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n")
+    (out / "index.json").write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding='utf-8')
     return len(index)
 
 
@@ -277,11 +262,12 @@ def main():
     parser.add_argument("--home", type=Path, default=Path.home())
     parser.add_argument("--root", action="append", default=[], metavar="AGENT=PATH", help="覆盖任一 agent 的数据根目录")
     parser.add_argument("--out", type=Path, help="新的证据输出目录（不得已存在）")
+    parser.add_argument("--cache-dir", type=Path, help="私有文件级解析缓存；未变文件复用完整脱敏记录")
     parser.add_argument("--max-chars", type=int, default=6000, help="每条消息字符上限；0 为完整保留")
     args = parser.parse_args()
     if args.max_chars < 0:
         parser.error("--max-chars 必须 >= 0")
-    tz = ZoneInfo(args.timezone) if args.timezone else None
+    tz = local_zone(args.timezone)
     now = datetime.now(tz).astimezone(tz)
     day = date.fromisoformat(args.date) if args.date else now.date()-timedelta(days=1)
     if day >= now.date():
@@ -295,11 +281,11 @@ def main():
         if not sep or key not in ROOTS:
             parser.error("--root 格式为 AGENT=PATH；AGENT: " + ", ".join(ROOTS))
         overrides[key] = Path(value).expanduser().resolve()
-    out = (args.out or args.home / ".local/share/daily-recap" / f"{day}-{now.strftime('%H%M%S-%f')}").expanduser().resolve()
+    out = (args.out or default_store() / f"{day}-{now.strftime('%H%M%S-%f')}").expanduser().resolve()
     if out.exists():
         parser.error("输出目录已存在，请使用新目录以保留旧报告")
     os.umask(0o077)
-    result = collect(args.home.expanduser(), overrides, start, end, now, args.max_chars)
+    result = collect(args.home.expanduser(), overrides, start, end, now, args.max_chars, args.cache_dir)
     count = save(result, out)
     print(json.dumps({"index": str(out / "index.json"), "sessions": count,
                       "warnings": len(result["warnings"]), "coverage": result["coverage"]}, ensure_ascii=False, indent=2))

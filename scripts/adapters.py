@@ -7,7 +7,9 @@ import subprocess
 def extra_records(path, source, warnings, stamp, text_of):
     sid, cwd = path.parent.name, None
     if source == "zcode-desktop":
-        obj = json.loads(path.read_text())
+        obj = json.loads(path.read_text(encoding='utf-8'))
+        if not isinstance(obj, dict) or not isinstance(obj.get('messages', []), list):
+            raise ValueError('desktop session must be an object with messages array')
         meta = obj.get("meta", {})
         for i, m in enumerate(obj.get("messages", [])):
             yield meta.get("taskId", path.stem), meta.get("workspacePath"), m.get("role"), stamp(m.get("timestamp")), text_of(m.get("content")), f"{path}#messages[{i}]"
@@ -17,7 +19,9 @@ def extra_records(path, source, warnings, stamp, text_of):
             state = parent / "state.json"
             if state.exists():
                 try:
-                    meta = json.loads(state.read_text())
+                    meta = json.loads(state.read_text(encoding='utf-8'))
+                    if not isinstance(meta, dict):
+                        raise ValueError('state must be an object')
                     cwd, sid = meta.get("cwd"), meta.get("id", parent.name)
                     break
                 except (ValueError, OSError):
@@ -26,10 +30,10 @@ def extra_records(path, source, warnings, stamp, text_of):
     proc = None
     if path.suffix == ".zstd":
         proc = subprocess.Popen(["zstd", "-dc", "--", str(path)], stdout=subprocess.PIPE,
-                                stderr=subprocess.DEVNULL, text=True, errors="replace")
+                                stderr=subprocess.DEVNULL, text=True, encoding='utf-8', errors='strict')
         handle = proc.stdout
     else:
-        handle = path.open(errors="replace")
+        handle = path.open(encoding='utf-8')
     try:
         with handle:
             for n, line in enumerate(handle, 1):

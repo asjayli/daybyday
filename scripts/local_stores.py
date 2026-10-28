@@ -13,7 +13,7 @@ def cursor_records(path, warnings, stamp):
     for workspace in (user_dir / "workspaceStorage").glob("*/workspace.json"):
         dbpath = workspace.parent / "state.vscdb"
         try:
-            folder = json.loads(workspace.read_text()).get("folder", "")
+            folder = json.loads(workspace.read_text(encoding='utf-8')).get("folder", "")
             if not folder.startswith("file:"):
                 continue
             cwd = unquote(urlparse(folder).path)
@@ -25,7 +25,7 @@ def cursor_records(path, warnings, stamp):
                 if row:
                     for item in json.loads(row[0]).get("allComposers", []):
                         workspaces[item["composerId"]] = cwd
-        except (OSError, ValueError, KeyError, sqlite3.Error) as exc:
+        except (OSError, ValueError, KeyError, TypeError, AttributeError, sqlite3.Error) as exc:
             warnings.append(f"{dbpath}: workspace metadata {type(exc).__name__}")
     with closing(sqlite3.connect(path.as_uri()+"?mode=ro", uri=True)) as db:
         db.execute("PRAGMA query_only=ON")
@@ -77,7 +77,7 @@ def inventory(home):
                 encrypted_evidence = None
                 if not sqlite_header:
                     for log in sorted((home / ".config/Trae CN/logs").glob("*/Modular/ai-agent*_stdout.log"), reverse=True):
-                        with log.open(errors="replace") as handle:
+                        with log.open(encoding='utf-8', errors='replace') as handle:
                             for line_no, line in enumerate(islice(handle, 300), 1):
                                 if "Database is already encrypted" in line:
                                     encrypted_evidence = f"{log}:{line_no}"
