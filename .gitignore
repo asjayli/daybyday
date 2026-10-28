@@ -1,0 +1,5 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+# Machine-specific audit notes are retained locally.
+REVIEW-2026-10-28.md
