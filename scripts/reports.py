@@ -207,14 +207,28 @@ def prepare(args):
                 atomic_json(work / 'failed.json', {'stage': Path(command[1]).name,
                                                   'returncode': exc.returncode})
                 raise SystemExit(f'准备材料失败（{Path(command[1]).name}）；状态保存在 {work / "failed.json"}') from exc
-        if source_signature(home, args.root, args.timezone) != live_signature:
-            atomic_json(work / 'failed.json', {'stage': 'collect', 'reason': 'source_changed_during_collection'})
-            raise SystemExit('采集期间来源发生变化；解析缓存已保留，请重试。')
         brief = out / "brief.md"
         sources = [out / "index.json"]
+        index_meta = metadata(sources[0])
+        current_signature = source_signature(home, args.root, args.timezone)
+        if current_signature != live_signature:
+            # Same rule as publish revalidation: appends after the evidence cutoff belong
+            # to the next update, so an ongoing session (including the one requesting this
+            # recap) cannot force a prepare retry loop; backdated writes into the window
+            # still fail the probe below.
+            probe = {"home": str(home), "store": str(store), "root_args": args.root,
+                     "timezone": args.timezone, "start": str(start),
+                     "evidence_at": index_meta.get("collected_at", checked_at),
+                     "evidence_signature": evidence_signature(sources[0]),
+                     "self_excluded": index_meta.get("self_excluded", [])}
+            if not relevant_sources_unchanged(probe, current_signature):
+                atomic_json(work / 'failed.json', {'stage': 'collect', 'reason': 'source_changed_during_collection'})
+                raise SystemExit('采集期间来源发生变化；解析缓存已保留，请重试。')
+            live_signature = current_signature
     else:
         sources, missing = inputs_for(store, args.period, start, end, today)
         brief = work / "brief.md"
+        index_meta = {}
         brief.write_text(aggregated_brief(sources, missing, start, end, args.budget), encoding='utf-8')
         if digest([fingerprint(sources), missing]) != live_signature:
             atomic_json(work / 'failed.json', {'stage': 'aggregate', 'reason': 'sources_changed'})
@@ -230,7 +244,6 @@ def prepare(args):
     if report_valid and previous_meta.get("mode") != "history" and not args.refresh and previous_evidence_hash == evidence_hash:
         cached("source_changed_but_relevant_evidence_unchanged", evidence_hash)
         return
-    index_meta = metadata(sources[0]) if args.period == "day" else {}
     evidence_at = index_meta.get("collected_at", checked_at) if args.period == "day" else checked_at
     draft = work / "draft.md"
     draft.write_text(make_template(args.period, key, start, end, tz).replace("> 证据截至：待填写", f"> 证据截至：{evidence_at}"), encoding='utf-8')

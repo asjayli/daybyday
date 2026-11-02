@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 from collect import collect, records
 from reports import prepare, publish, aggregated_brief
+from freshness import source_signature
 from backfill import backfill
 
 SCRIPTS = Path(__file__).resolve().parents[1] / 'scripts'
@@ -244,6 +245,37 @@ class IntegrationTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             self.finish(result)
         self.assertFalse(Path(result['report']).exists())
+
+    def concurrent_append(self, at):
+        """Intercept prepare's post-collect signature check to append like an active session."""
+        real, calls = source_signature, []
+
+        def fake(home, roots, tz):
+            if len(calls) == 1:  # 第二次调用即 collect 之后的复查：此刻模拟并发写入
+                self.append_line(self.concurrent_path, '采集期间的并发消息', at)
+            calls.append(1)
+            return real(home, roots, tz)
+        return patch('reports.source_signature', side_effect=fake)
+
+    def test_prepare_survives_concurrent_append_during_collect(self):
+        self.concurrent_path = self.source()
+        # 晚于证据截止的并发追加（如正在请求回顾的活跃会话）：prepare 不得无限重试。
+        with self.concurrent_append(datetime.now(self.tz) + timedelta(minutes=5)):
+            result = self.prep()
+        self.assertEqual(result['status'], 'prepared')
+        self.fill(result)
+        self.finish(result)
+        self.assertTrue(Path(result['report']).exists())
+
+    def test_prepare_rejects_backdated_append_during_collect(self):
+        self.concurrent_path = self.source()
+        # 窗口内的回溯写入仍是真实证据变化，必须拒绝并留痕。
+        with self.concurrent_append(self.start + timedelta(hours=2)):
+            with self.assertRaises(SystemExit):
+                self.prep()
+        failed = sorted((self.store / 'evidence' / 'daily' / str(self.day)).glob('*/failed.json'))
+        self.assertTrue(any('source_changed_during_collection' in p.read_text(encoding='utf-8')
+                            for p in failed))
 
     def test_partial_trailing_line_is_not_a_warning(self):
         path = self.source('halfline', at=self.start)
