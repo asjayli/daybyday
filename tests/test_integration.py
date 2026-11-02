@@ -277,6 +277,23 @@ class IntegrationTests(unittest.TestCase):
         self.assertTrue(any('source_changed_during_collection' in p.read_text(encoding='utf-8')
                             for p in failed))
 
+    def test_prepare_survives_continuous_source_churn(self):
+        # 宿主每隔几秒触碰会话库（如 SQLite WAL 心跳）：原始签名持续漂移，
+        # 但截至证据截止的语义不变时，prepare 与 publish 都不得死锁。
+        self.concurrent_path = self.source()
+        real = source_signature
+
+        def churn(home, roots, tz):
+            self.append_line(self.concurrent_path, '持续后台追加',
+                             datetime.now(self.tz) + timedelta(minutes=5))
+            return real(home, roots, tz)
+        with patch('reports.source_signature', side_effect=churn):
+            result = self.prep()
+        self.assertEqual(result['status'], 'prepared')
+        self.fill(result)
+        self.finish(result)
+        self.assertTrue(Path(result['report']).exists())
+
     def test_partial_trailing_line_is_not_a_warning(self):
         path = self.source('halfline', at=self.start)
         with path.open('a', encoding='utf-8') as handle:

@@ -221,7 +221,7 @@ def prepare(args):
                      "evidence_at": index_meta.get("collected_at", checked_at),
                      "evidence_signature": evidence_signature(sources[0]),
                      "self_excluded": index_meta.get("self_excluded", [])}
-            if not relevant_sources_unchanged(probe, current_signature):
+            if not relevant_sources_unchanged(probe):
                 atomic_json(work / 'failed.json', {'stage': 'collect', 'reason': 'source_changed_during_collection'})
                 raise SystemExit('采集期间来源发生变化；解析缓存已保留，请重试。')
             live_signature = current_signature
@@ -313,19 +313,22 @@ def validate_sources(manifest):
                                         datetime.now(tz).date())
             current = digest([fingerprint(files), missing])
         if current != manifest['live_signature']:
-            if manifest['period'] != 'day' or not relevant_sources_unchanged(manifest, current):
+            if manifest['period'] != 'day' or not relevant_sources_unchanged(manifest):
                 raise SystemExit('原始来源或汇总来源集合已变化，请重新 prepare。')
             manifest['live_signature'] = current
     except (OSError, ValueError, KeyError, TypeError) as exc:
         raise SystemExit(f'来源无法校验，请重新 prepare：{type(exc).__name__}') from exc
 
 
-def relevant_sources_unchanged(manifest, signature):
+def relevant_sources_unchanged(manifest):
     """Unrelated appends (including this reporting session) must not deadlock publication.
 
     Re-collect only up to the report's evidence cutoff: messages appended after it
     belong to the next update, not to this report, so ongoing sessions cannot force
     a republish loop. Appends dated before the cutoff still change the signature.
+    Raw-file stability is deliberately not re-checked: a host may touch its session
+    database (e.g. SQLite WAL heartbeats) every few seconds, so only the semantic
+    evidence comparison is trustworthy.
     """
     from collect import collect, save
     from datetime import time
@@ -345,8 +348,7 @@ def relevant_sources_unchanged(manifest, signature):
     with tempfile.TemporaryDirectory(prefix='verify-', dir=store / 'evidence') as temporary:
         index = Path(temporary) / 'data'
         save(result, index)
-        same = evidence_signature(index / 'index.json') == manifest['evidence_signature']
-    return same and source_signature(Path(manifest['home']), manifest['root_args'], manifest['timezone']) == signature
+        return evidence_signature(index / 'index.json') == manifest['evidence_signature']
 
 
 def publish(args):
