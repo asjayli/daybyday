@@ -4,7 +4,7 @@ description: "汇总本机多个 AI agent 的历史会话，回顾工作进展�
 compatibility: "Python 3.11+；DeepSeek Harness 的 .zstd 会话需系统 zstd。通过 shell 运行脚本。"
 ---
 
-# Daybyday · 工作回顾与接续
+# daybyday · 工作回顾与接续
 
 先用脚本提取和压缩证据，模型负责语义合并、判断与成稿。脚本不调用模型，不联网。
 
