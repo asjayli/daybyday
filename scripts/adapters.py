@@ -38,7 +38,13 @@ def extra_records(path, source, warnings, stamp, text_of):
         with handle:
             for n, line in enumerate(handle, 1):
                 try:
-                    o = json.loads(line)
+                    try:
+                        o = json.loads(line)
+                    except ValueError:
+                        if not line.endswith("\n"):
+                            # Trailing line still being written by an active session; retry next scan.
+                            break
+                        raise
                     kind, ts = o.get("type"), stamp(o.get("time", o.get("timestamp")))
                     role, text = None, ""
                     if source == "deepseek-harness":
