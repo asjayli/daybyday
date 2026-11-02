@@ -41,8 +41,9 @@ def extra_records(path, source, warnings, stamp, text_of):
                     try:
                         o = json.loads(line)
                     except ValueError:
-                        if not line.endswith("\n"):
+                        if not line.endswith("\n") and proc is None:
                             # Trailing line still being written by an active session; retry next scan.
+                            # Compressed (.zstd) archives cannot be mid-append: a torn tail is real damage.
                             break
                         raise
                     kind, ts = o.get("type"), stamp(o.get("time", o.get("timestamp")))

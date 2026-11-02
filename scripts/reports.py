@@ -327,7 +327,8 @@ def relevant_sources_unchanged(manifest, signature):
              (item.split('=', 1) for item in manifest['root_args'])}
     store = Path(manifest['store'])
     result = collect(Path(manifest['home']), roots, start, end, cutoff,
-                     cache_dir=store / 'cache/records', self_paths=manifest.get('self_excluded', []))
+                     cache_dir=store / 'cache/records', self_paths=manifest.get('self_excluded', []),
+                     self_env=False)
     with tempfile.TemporaryDirectory(prefix='verify-', dir=store / 'evidence') as temporary:
         index = Path(temporary) / 'data'
         save(result, index)

@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import re
 import sqlite3
+import sys
 from adapters import extra_records
 from local_stores import cursor_records, cursor_session_ids, inventory
 
@@ -123,30 +124,39 @@ def db_records(path, start, now):
                 yield sid, cwd, m.get("role"), stamp(ts), p.get("text", ""), f"{path}#message={mid}&part={pid}"
 
 
-def self_sources(home, extra=()):
+def self_sources(home, extra=(), use_env=True):
     """Resolve the running session's own transcript files once at startup.
 
     Host-provided identifiers are honoured (Pi session file, Claude Code session id);
     `extra` carries explicit `--self` paths. Collection skips sessions marked here,
     so the recap request itself never becomes evidence or shakes the signature.
+    `use_env=False` replays a manifest's fixed exclusion list only: publish
+    revalidation must not re-read the (possibly different) current environment.
     """
     found = set()
-    pi = os.environ.get("PI_SESSION_FILE")
-    if pi:
-        found.add(str(Path(pi).expanduser().resolve()))
-    sid = os.environ.get("CLAUDE_CODE_SESSION_ID")
-    if sid:
-        for path in (home / ".claude" / "projects").rglob(sid + ".jsonl"):
-            found.add(str(path.resolve()))
+    if use_env:
+        pi = os.environ.get("PI_SESSION_FILE")
+        if pi:
+            found.add(str(Path(pi).expanduser().resolve()))
+        sid = os.environ.get("CLAUDE_CODE_SESSION_ID")
+        if sid:
+            if any(ch in sid for ch in "*?["):
+                print(f"CLAUDE_CODE_SESSION_ID 含通配符，忽略该标识：{sid!r}", file=sys.stderr)
+            else:
+                for path in (home / ".claude" / "projects").rglob(sid + ".jsonl"):
+                    found.add(str(path.resolve()))
     for item in extra:
-        found.add(str(Path(item).expanduser().resolve()))
+        resolved = Path(item).expanduser().resolve()
+        if not resolved.exists():
+            print(f"--self 路径不存在，未排除任何会话：{item}", file=sys.stderr)
+        found.add(str(resolved))
     return found
 
 
-def collect(home, overrides, start, end, now, max_chars=6000, cache_dir=None, self_paths=()):
+def collect(home, overrides, start, end, now, max_chars=6000, cache_dir=None, self_paths=(), self_env=True):
     sessions, coverage, warnings, uncertain = {}, {}, [], []
     cache = RecordCache(cache_dir, parser_version()) if cache_dir else None
-    self_set = self_sources(home, self_paths)
+    self_set = self_sources(home, self_paths, use_env=self_env)
     cursor_db = overrides.get("cursor-db", home / ROOTS["cursor-db"])
     try:
         mirrored_ids = cursor_session_ids(cursor_db)

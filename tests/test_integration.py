@@ -6,6 +6,7 @@ import io
 import os
 import json
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -283,6 +284,70 @@ class IntegrationTests(unittest.TestCase):
         self.assertNotIn('today-only', {s['session_id'] for s in result['sessions']})
         mine_kept = self.scan(self_extra=[str(mine)])
         self.assertIn('mine', {s['session_id'] for s in mine_kept['sessions']})
+
+
+    def test_publish_revalidation_ignores_current_env_self_markers(self):
+        # manifest 固化的排除清单是发布重验证的唯一依据；当前进程 env 不得改变证据集合。
+        # 同 cwd 的今日会话放在 .claude/projects 下，env 标识可以精确定位它。
+        self.source()
+        other = self.home / '.claude' / 'projects' / 'p' / 'today-c.jsonl'
+        other.parent.mkdir(parents=True, exist_ok=True)
+        other.write_text(json.dumps({'type': 'session', 'id': 'today-c', 'cwd': '/project'}) + '\n' +
+                         json.dumps({'timestamp': (self.end + timedelta(hours=1)).isoformat(),
+                                     'message': {'role': 'user', 'content': '今天继续'}}) + '\n', encoding='utf-8')
+        env = {k: v for k, v in os.environ.items() if k != 'CLAUDE_CODE_SESSION_ID'}
+        with patch.dict(os.environ, env, clear=True):
+            result = self.prep()
+            self.fill(result)
+            evidence_at = datetime.fromisoformat(json.loads(
+                Path(result['manifest']).read_text(encoding='utf-8'))['evidence_at'])
+            self.append_line(other, '又推进一步', evidence_at + timedelta(minutes=3))
+            with patch.dict(os.environ, {'CLAUDE_CODE_SESSION_ID': 'today-c'}):
+                self.finish(result)
+        self.assertTrue(Path(result['report']).exists())
+
+    def test_message_exactly_at_evidence_cutoff_allows_publish(self):
+        path = self.source()
+        result = self.prep()
+        self.fill(result)
+        evidence_at = datetime.fromisoformat(json.loads(
+            Path(result['manifest']).read_text(encoding='utf-8'))['evidence_at'])
+        # 半开区间：恰等于截止时间的消息归下一次更新，不拒绝本次发布。
+        self.append_line(path, '恰好截止', evidence_at)
+        self.finish(result)
+        self.assertTrue(Path(result['report']).exists())
+
+    def test_wildcard_session_id_env_is_ignored(self):
+        self.source()
+        keep = self.home / '.claude' / 'projects' / 'p' / 'keep.jsonl'
+        keep.parent.mkdir(parents=True, exist_ok=True)
+        keep.write_text(json.dumps({'type': 'session', 'id': 'keep', 'cwd': '/project'}) + '\n' +
+                        json.dumps({'timestamp': self.start.isoformat(),
+                                    'message': {'role': 'user', 'content': '昨日的真实工作'}}) + '\n', encoding='utf-8')
+        with patch.dict(os.environ, {'CLAUDE_CODE_SESSION_ID': '*'}):
+            result = self.scan()
+        self.assertIn('keep', {s['session_id'] for s in result['sessions']})
+
+    def test_self_path_missing_warns_and_is_ignored(self):
+        self.source()
+        err = io.StringIO()
+        with redirect_stderr(err):
+            result = self.scan(self_extra=[str(self.base / 'no-such-session.jsonl')])
+        self.assertIn('不存在', err.getvalue())
+        self.assertEqual(len(result['sessions']), 1)
+
+    @unittest.skipUnless(shutil.which('zstd'), 'zstd unavailable')
+    def test_zstd_torn_tail_is_reported_as_damage(self):
+        plain = self.base / 'torn.jsonl'
+        plain.write_text(json.dumps({'type': 'session', 'id': 'ds', 'cwd': '/p'}) + '\n' +
+                         json.dumps({'type': 'user/message', 'time': self.start.timestamp() * 1000,
+                                     'data': {'content': [{'type': 'text', 'text': '任务'}]}}) + '\n' +
+                         '{"type": "user/message", "time": ', encoding='utf-8')
+        target = self.home / '.dsh' / 'sessions' / 'session.v3.jsonl.zstd'
+        target.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run(['zstd', '-q', str(plain), '-o', str(target)], check=True)
+        result = self.scan()
+        self.assertTrue([w for w in result['warnings'] if 'session.v3.jsonl.zstd' in w])
 
 
 if __name__ == '__main__':
