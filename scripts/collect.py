@@ -80,7 +80,13 @@ def records(path, source, warnings):
     with path.open(encoding='utf-8') as handle:
         for n, line in enumerate(handle, 1):
             try:
-                obj = json.loads(line)
+                try:
+                    obj = json.loads(line)
+                except ValueError:
+                    if not line.endswith("\n"):
+                        # Trailing line still being written by an active session; retry next scan.
+                        break
+                    raise
                 if not isinstance(obj, dict):
                     raise ValueError("record is not an object")
                 if source == "codex":
@@ -117,9 +123,30 @@ def db_records(path, start, now):
                 yield sid, cwd, m.get("role"), stamp(ts), p.get("text", ""), f"{path}#message={mid}&part={pid}"
 
 
-def collect(home, overrides, start, end, now, max_chars=6000, cache_dir=None):
+def self_sources(home, extra=()):
+    """Resolve the running session's own transcript files once at startup.
+
+    Host-provided identifiers are honoured (Pi session file, Claude Code session id);
+    `extra` carries explicit `--self` paths. Collection skips sessions marked here,
+    so the recap request itself never becomes evidence or shakes the signature.
+    """
+    found = set()
+    pi = os.environ.get("PI_SESSION_FILE")
+    if pi:
+        found.add(str(Path(pi).expanduser().resolve()))
+    sid = os.environ.get("CLAUDE_CODE_SESSION_ID")
+    if sid:
+        for path in (home / ".claude" / "projects").rglob(sid + ".jsonl"):
+            found.add(str(path.resolve()))
+    for item in extra:
+        found.add(str(Path(item).expanduser().resolve()))
+    return found
+
+
+def collect(home, overrides, start, end, now, max_chars=6000, cache_dir=None, self_paths=()):
     sessions, coverage, warnings, uncertain = {}, {}, [], []
     cache = RecordCache(cache_dir, parser_version()) if cache_dir else None
+    self_set = self_sources(home, self_paths)
     cursor_db = overrides.get("cursor-db", home / ROOTS["cursor-db"])
     try:
         mirrored_ids = cursor_session_ids(cursor_db)
@@ -218,10 +245,13 @@ def collect(home, overrides, start, end, now, max_chars=6000, cache_dir=None):
             selected.append(s)
     selected.sort(key=lambda s: (s["cwd"] or "", s["messages"][0]["at"]))
     projects = {s["cwd"] for s in selected if s["cwd"]}
-    active_session = os.environ.get("PI_SESSION_FILE")
     continuations = []
+    self_excluded = sorted(
+        s["source"] for s in sessions.values()
+        if str(Path(s["source"]).resolve()) in self_set
+        and not any(m["period"] == "target" for m in s["messages"]))
     for s in sessions.values():
-        if (s["cwd"] in projects and s["source"] != active_session
+        if (s["cwd"] in projects and str(Path(s["source"]).resolve()) not in self_set
                 and not any(m["period"] == "target" for m in s["messages"])):
             s["messages"].sort(key=lambda m: m["at"])
             s["continuation_only"] = True
@@ -230,6 +260,7 @@ def collect(home, overrides, start, end, now, max_chars=6000, cache_dir=None):
     return {"date": start.date().isoformat(), "window": [start.isoformat(), end.isoformat()],
             "collected_at": now.isoformat(), "coverage": coverage, "warnings": warnings,
             "cache": {"hits": cache.hits, "misses": cache.misses} if cache else None,
+            "self_excluded": self_excluded,
             "undated_sources": uncertain, "additional_candidates": inventory(home), "sessions": selected}
 
 
@@ -263,6 +294,8 @@ def main():
     parser.add_argument("--root", action="append", default=[], metavar="AGENT=PATH", help="覆盖任一 agent 的数据根目录")
     parser.add_argument("--out", type=Path, help="新的证据输出目录（不得已存在）")
     parser.add_argument("--cache-dir", type=Path, help="私有文件级解析缓存；未变文件复用完整脱敏记录")
+    parser.add_argument("--self", action="append", default=[], metavar="PATH",
+                        help="本次回顾自身会话的记录文件；该会话不作为证据或后续候选")
     parser.add_argument("--max-chars", type=int, default=6000, help="每条消息字符上限；0 为完整保留")
     args = parser.parse_args()
     if args.max_chars < 0:
@@ -285,7 +318,8 @@ def main():
     if out.exists():
         parser.error("输出目录已存在，请使用新目录以保留旧报告")
     os.umask(0o077)
-    result = collect(args.home.expanduser(), overrides, start, end, now, args.max_chars, args.cache_dir)
+    result = collect(args.home.expanduser(), overrides, start, end, now, args.max_chars,
+                     args.cache_dir, args.self)
     count = save(result, out)
     print(json.dumps({"index": str(out / "index.json"), "sessions": count,
                       "warnings": len(result["warnings"]), "coverage": result["coverage"]}, ensure_ascii=False, indent=2))

@@ -196,6 +196,8 @@ def prepare(args):
             command += ["--timezone", args.timezone]
         for root in args.root:
             command += ["--root", root]
+        for item in getattr(args, "self", []):
+            command += ["--self", item]
         commands = [command, [sys.executable, str(BASE / 'brief.py'), str(out / 'index.json'),
                               '--budget', str(args.budget)]]
         for command in commands:
@@ -228,7 +230,8 @@ def prepare(args):
     if report_valid and previous_meta.get("mode") != "history" and not args.refresh and previous_evidence_hash == evidence_hash:
         cached("source_changed_but_relevant_evidence_unchanged", evidence_hash)
         return
-    evidence_at = (metadata(sources[0])["collected_at"] if args.period == "day" else checked_at)
+    index_meta = metadata(sources[0]) if args.period == "day" else {}
+    evidence_at = index_meta.get("collected_at", checked_at) if args.period == "day" else checked_at
     draft = work / "draft.md"
     draft.write_text(make_template(args.period, key, start, end, tz).replace("> 证据截至：待填写", f"> 证据截至：{evidence_at}"), encoding='utf-8')
     manifest = {"mode": "live", "period": args.period, "key": key, "start": str(start), "end": str(end),
@@ -241,6 +244,7 @@ def prepare(args):
                 'home': str(home), 'store': str(store),
                 'evidence_files_fingerprint': evidence_files_fingerprint(sources[0]) if args.period == 'day' else None,
                 "root_args": args.root, "timezone": args.timezone,
+                "self_excluded": index_meta.get("self_excluded", []),
                 "previous_report_fingerprint": fingerprint([target]) if target.exists() else None}
     manifest_path = work / "manifest.json"
     atomic_json(manifest_path, manifest)
@@ -304,17 +308,26 @@ def validate_sources(manifest):
 
 
 def relevant_sources_unchanged(manifest, signature):
-    """Unrelated appends (including this reporting session) must not deadlock publication."""
+    """Unrelated appends (including this reporting session) must not deadlock publication.
+
+    Re-collect only up to the report's evidence cutoff: messages appended after it
+    belong to the next update, not to this report, so ongoing sessions cannot force
+    a republish loop. Appends dated before the cutoff still change the signature.
+    """
     from collect import collect, save
     from datetime import time
     tz = local_zone(manifest['timezone'])
     start = datetime.combine(date.fromisoformat(manifest['start']), time.min, tzinfo=tz)
     end = datetime.combine(start.date() + timedelta(days=1), time.min, tzinfo=tz)
+    try:
+        cutoff = datetime.fromisoformat(manifest['evidence_at'])
+    except (KeyError, ValueError, TypeError):
+        cutoff = datetime.now(tz)
     roots = {k: Path(v).expanduser().resolve() for k, v in
              (item.split('=', 1) for item in manifest['root_args'])}
     store = Path(manifest['store'])
-    result = collect(Path(manifest['home']), roots, start, end, datetime.now(tz),
-                     cache_dir=store / 'cache/records')
+    result = collect(Path(manifest['home']), roots, start, end, cutoff,
+                     cache_dir=store / 'cache/records', self_paths=manifest.get('self_excluded', []))
     with tempfile.TemporaryDirectory(prefix='verify-', dir=store / 'evidence') as temporary:
         index = Path(temporary) / 'data'
         save(result, index)
@@ -373,6 +386,8 @@ def main():
     p.add_argument("--budget", type=int, default=12000)
     p.add_argument("--refresh", action="store_true")
     p.add_argument("--root", action="append", default=[])
+    p.add_argument('--self', action='append', default=[], metavar='PATH',
+                   help='本次回顾自身会话的记录文件；自动识别宿主环境变量，此处可显式补充')
     p = sub.add_parser("publish", help="核验模板后原子发布到固定目录")
     p.add_argument("manifest", type=Path)
     args = parser.parse_args()

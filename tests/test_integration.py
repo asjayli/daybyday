@@ -3,6 +3,7 @@ import argparse
 from contextlib import redirect_stdout, redirect_stderr
 from datetime import datetime, timedelta
 import io
+import os
 import json
 from pathlib import Path
 import subprocess
@@ -60,9 +61,9 @@ class IntegrationTests(unittest.TestCase):
         with redirect_stdout(io.StringIO()):
             publish(argparse.Namespace(manifest=Path(result['manifest'])))
 
-    def scan(self, cache=True):
+    def scan(self, cache=True, self_extra=()):
         return collect(self.home, {}, self.start, self.end, datetime.now(self.tz),
-                       cache_dir=self.base / 'cache' if cache else None)
+                       cache_dir=self.base / 'cache' if cache else None, self_paths=self_extra)
 
     def test_incremental_cache_reuses_records_and_invalidates_changes(self):
         path = self.source()
@@ -211,6 +212,77 @@ class IntegrationTests(unittest.TestCase):
         brief = aggregated_brief(sources, [], self.day, self.day, 2000)
         self.assertLessEqual(len(brief), 2000)
         self.assertIn('预算不足', brief)
+
+
+    # --- 兼容并发活动会话：发布窗口、半行写入、自身会话标记 ---
+
+    def append_line(self, path, text, at):
+        with path.open('a', encoding='utf-8') as handle:
+            handle.write(json.dumps({'timestamp': at.isoformat(),
+                                     'message': {'role': 'assistant', 'content': text}}) + '\n')
+
+    def test_relevant_append_after_evidence_at_allows_publish(self):
+        path = self.source()
+        result = self.prep()
+        self.fill(result)
+        evidence_at = datetime.fromisoformat(json.loads(
+            Path(result['manifest']).read_text(encoding='utf-8'))['evidence_at'])
+        # 同项目相关会话在证据截止之后继续追加：属下一次更新范围，不得拒绝本次发布。
+        self.append_line(path, '刚又推进了一步', evidence_at + timedelta(minutes=5))
+        self.finish(result)
+        self.assertTrue(Path(result['report']).exists())
+
+    def test_backdated_relevant_append_still_rejects_publish(self):
+        path = self.source()
+        result = self.prep()
+        self.fill(result)
+        evidence_at = datetime.fromisoformat(json.loads(
+            Path(result['manifest']).read_text(encoding='utf-8'))['evidence_at'])
+        # 追加的消息时间早于证据截止：真实证据变化，仍须拒绝。
+        self.append_line(path, '截止前的补充', evidence_at - timedelta(minutes=1))
+        with self.assertRaises(SystemExit):
+            self.finish(result)
+        self.assertFalse(Path(result['report']).exists())
+
+    def test_partial_trailing_line_is_not_a_warning(self):
+        path = self.source('halfline', at=self.start)
+        with path.open('a', encoding='utf-8') as handle:
+            handle.write('{"timestamp": "' + self.start.isoformat())  # 正在写入的半行
+        result = self.scan()
+        self.assertEqual([w for w in result['warnings'] if 'halfline' in w], [])
+
+    def test_self_session_by_env_excluded_from_candidates(self):
+        self.source()
+        # CLAUDE_CODE_SESSION_ID 对应 .claude/projects 下的同名会话文件
+        mine = self.home / '.claude' / 'projects' / 'p' / 'me-now.jsonl'
+        mine.parent.mkdir(parents=True, exist_ok=True)
+        mine.write_text(json.dumps({'type': 'session', 'id': 'me-now', 'cwd': '/project'}) + '\n' +
+                        json.dumps({'timestamp': (self.end + timedelta(hours=2)).isoformat(),
+                                    'message': {'role': 'user', 'content': '帮我回顾昨天'}}) + '\n', encoding='utf-8')
+        with patch.dict(os.environ, {'CLAUDE_CODE_SESSION_ID': 'me-now'}):
+            result = self.scan()
+        self.assertNotIn('me-now', {s['session_id'] for s in result['sessions']})
+        self.assertIn('me-now', {Path(p).stem for p in result.get('self_excluded', [])})
+
+    def test_self_session_by_arg_and_midnight_retention(self):
+        self.source()
+        mine = self.home / '.pi/agent/sessions/mine.jsonl'
+        mine.parent.mkdir(parents=True, exist_ok=True)
+        mine.write_text('\n'.join(json.dumps(row) for row in [
+            {'type': 'session', 'id': 'mine', 'cwd': '/project'},
+            {'timestamp': self.start.isoformat(), 'message': {'role': 'user', 'content': '昨天的工作'}},
+            {'timestamp': (self.end + timedelta(hours=1)).isoformat(),
+             'message': {'role': 'user', 'content': '今天继续，顺便回顾昨天'}}]) + '\n', encoding='utf-8')
+        others = self.home / '.pi/agent/sessions/today-only.jsonl'
+        others.write_text('\n'.join(json.dumps(row) for row in [
+            {'type': 'session', 'id': 'today-only', 'cwd': '/project'},
+            {'timestamp': (self.end + timedelta(hours=3)).isoformat(),
+             'message': {'role': 'user', 'content': '今天的新会话'}}]) + '\n', encoding='utf-8')
+        result = self.scan(self_extra=[str(others)])
+        # 显式标记的纯今日会话被排除；跨午夜含昨日消息的自身会话保留昨日证据。
+        self.assertNotIn('today-only', {s['session_id'] for s in result['sessions']})
+        mine_kept = self.scan(self_extra=[str(mine)])
+        self.assertIn('mine', {s['session_id'] for s in mine_kept['sessions']})
 
 
 if __name__ == '__main__':
